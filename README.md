@@ -53,16 +53,10 @@ Abra `http://127.0.0.1:5000/` no navegador:
 
 | Modo | O que precisa |
 |---|---|
-| **Docker** (recomendado) | Docker Desktop (WSL2) + `.env` preenchido |
-| **Host direto** | Python 3.10+, `pip install -r requirements.txt` |
+| **Docker** (recomendado) | Docker Desktop (ou equivalente com compose v2) — nada mais |
+| **Host direto** | Python 3.10+ |
 
-Em ambos: arquivo `.env` na raiz (copie de `.env.example`):
-
-```dotenv
-NVIDIA_API_KEY_1=nvapi-xxxxxxxx     # obrigatório (até 10 keys)
-PROXY_MODEL=z-ai/glm-5.3            # obrigatório no Docker
-# PROXY_PORT=5000                   # porta do host (Docker)
-```
+Em ambos os casos você precisa de **ao menos uma API key da NVIDIA NIM** (gratuita em https://build.nvidia.com → "Get API Key") — a configuração é feita no `.env`, mostrada no passo 2 abaixo.
 
 Modelos disponíveis: `moonshotai/kimi-k3`, `z-ai/glm-5.3`, `nvidia/nemotron-3-super-120b-a12b`, `nvidia/nemotron-3.5-lightning-30b-a3b`, `deepseek-ai/deepseek-v4.1-flash`, `z-ai/glm-5.3-flash`.
 
@@ -70,14 +64,43 @@ Modelos disponíveis: `moonshotai/kimi-k3`, `z-ai/glm-5.3`, `nvidia/nemotron-3-s
 
 ## Como rodar
 
-### Opção A — Docker (recomendado)
+### 1. Clone o repositório
 
 ```bash
-cd C:\Proxy-hermes
+git clone <URL-do-repo> nvidia-proxy
+cd nvidia-proxy
+```
+
+(Windows: `git clone <URL-do-repo> C:\nvidia-proxy` e `cd C:\nvidia-proxy`.)
+
+### 2. Configure suas keys da NVIDIA
+
+Crie o `.env` a partir do template:
+
+```bash
+cp .env.example .env        # Windows PowerShell: copy .env.example .env
+```
+
+Edite o `.env` e preencha ao menos uma key (obtida em https://build.nvidia.com, em "Get API Key"):
+
+```dotenv
+NVIDIA_API_KEY_1=nvapi-xxxxxxxxxxxxxxxxxxxxxxxx
+PROXY_MODEL=z-ai/glm-5.3
+```
+
+Preencher mais keys (`NVIDIA_API_KEY_2`..`10`) aumenta a vazão agregada — o proxy faz o pool delas.
+
+### 3. Escolha como rodar
+
+### Opção A — Docker (recomendado)
+
+Pré-requisito: Docker Desktop (ou qualquer Docker com compose v2).
+
+```bash
 docker compose up -d --build
 ```
 
-Sobe **um container** com proxy + dashboard juntos (build multi-stage: o React é compilado dentro da imagem; a imagem final é só Python + estáticos). Primeiro build: alguns minutos; seguintes: segundos (cache).
+Sobe **um container** com proxy + dashboard juntos (build multi-stage: o React é compilado dentro da imagem; a imagem final é só Python + estáticos). Primeiro build: alguns minutos; seguintes: segundos (cache). Não é preciso ter Python ou Node na máquina — só o Docker.
 
 | URL | O quê |
 |---|---|
@@ -100,8 +123,9 @@ Detalhes (healthcheck, logs rotativos, bind loopback, troca de porta sem conflit
 
 ### Opção B — Direto no host
 
+Pré-requisito: Python 3.10+.
+
 ```bash
-cd C:\Proxy-hermes
 pip install -r requirements.txt
 python proxy.py
 ```
@@ -110,8 +134,10 @@ Sem `PROXY_MODEL` no `.env`, abre o **menu interativo** de seleção de modelo n
 
 ### Desenvolvimento do dashboard
 
+Pré-requisito: Node 18+.
+
 ```bash
-cd C:\Proxy-hermes\web
+cd web
 npm install        # primeira vez
 npm run dev        # Vite em http://localhost:5173 (proxy → :5000)
 npm run build      # build de produção em web/dist (servido pelo Flask)
@@ -166,10 +192,10 @@ curl -X POST http://127.0.0.1:5000/admin/model \
 ## Estrutura do projeto
 
 ```
-C:\Proxy-hermes\
+nvidia-proxy/
 ├── proxy.py               # API Flask (pool, failover, rate limit, admin)
 ├── requirements.txt       # flask, requests, python-dotenv, waitress
-├── .env.example            # template de configuração (.env real é gitignored)
+├── .env.example           # template de configuração (.env real é gitignored)
 ├── Dockerfile              # multi-stage: node compila o front → python serve
 ├── docker-compose.yml      # deploy local (loopback only, healthcheck)
 ├── .dockerignore
@@ -184,11 +210,7 @@ C:\Proxy-hermes\
 
 ## Testes
 
-Suíte funcional (failover, rate limit, erros OpenAI, headers, admin): 30/30 passando — roda contra o Flask test client com o upstream mockado, não consome quota:
-
-```bash
-python test_proxy.py   # ver header do arquivo para envs de teste
-```
+Suíte funcional (failover, rate limit, erros OpenAI, headers, admin): 30/30 passando — roda contra o Flask test client com o upstream mockado, não consome quota. Os testes mockam `requests.request` e setam as envs de teste antes do import (o módulo exige keys no env para subir).
 
 ## Histórico de qualidade
 
