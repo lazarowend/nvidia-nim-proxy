@@ -1,6 +1,7 @@
 # Segredos — NUNCA versionar
 .env
 .env.*
+!.env.example
 backup_*/
 
 # Python
