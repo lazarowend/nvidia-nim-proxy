@@ -27,7 +27,7 @@ Token bucket por key (39 RPM, configurável): cada key só é usada na velocidad
 - **`GET /v1/models` coerente**: lista só o que o proxy realmente serve (não o catálogo inteiro da NVIDIA)
 - **Model override**: todo completion usa o modelo selecionado, independentemente do que o cliente pediu — troque de modelo sem reconfigurar nada no cliente
 - **Streaming SSE transparente** com proteção contra o bug de `Content-Encoding` (corpo descomprimido × header gzip) e headers hop-by-hop filtrados (RFC 9110)
-- **`POST /v1/completions` (legacy)**: tradução de protocolo — o NVIDIA NIM não expõe o endpoint nativo, o proxy converte para chat/completions no upstream e devolve `choices[0].text` no formato que clientes legacy esperam (mesmo pool, failover e token bucket; `stream` não suportado nesta rota)
+- **`POST /v1/completions` (legacy)**: tradução de protocolo — o NVIDIA NIM não expõe o endpoint nativo, o proxy converte para chat/completions no upstream e devolve `choices[0].text` no formato que clientes legacy esperam (mesmo pool, failover e token bucket; streaming suportado com conversão SSE on-the-fly — raciocínio interno de modelos reasoning é descartado, só o texto final flui)
 
 ### 4. Dashboard web integrado (React)
 Abra `http://127.0.0.1:5000/` no navegador:

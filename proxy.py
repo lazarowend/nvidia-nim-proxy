@@ -38,7 +38,7 @@ load_dotenv()
 
 app = Flask(__name__)
 
-PROXY_VERSION = "2.2.0"
+PROXY_VERSION = "2.3.0"
 
 TARGET_URL = os.getenv("PROXY_TARGET_URL", "https://integrate.api.nvidia.com")
 
@@ -691,11 +691,11 @@ def proxy(path):
 # bucket) e traduz a resposta de volta (choices[0].message.content
 # -> choices[0].text), formato esperado por clientes legacy.
 #
-# Decisão de design — stream: REJEITADO com 400. Converter SSE de
-# chat para SSE de completions exigiria parser de eventos, buffer de
-# deltas e remontagem de text on-the-fly; clientes legacy que usam
-# /v1/completions raramente streamam, e a simplicidade correta vale
-# mais que cobertura completa. Documentado e com erro claro.
+# Decisão de design — stream: SUPORTADO (v2.3.0). O SSE de chat
+# (choices[0].delta.content) é convertido on-the-fly para SSE de
+# completions (choices[0].text), exigido por clientes de autocomplete.
+# Casos sem delta.content (ex.: chamadas de ferramenta) produzem
+# chunks de texto vazio — presença da chave mantém o contrato.
 
 # Campos de completions aceitos e repassados ao chat/completions.
 COMPLETIONS_PASSTHROUGH_FIELDS = (
@@ -717,13 +717,8 @@ def legacy_completions():
         )
 
     # -------- Validações do formato legacy --------
-    if "stream" in body and body["stream"]:
-        return openai_error(
-            400,
-            "stream=true não é suportado em /v1/completions. "
-            "Use /v1/chat/completions para streaming.",
-            "invalid_request_error",
-        )
+    # stream=true é aceito: repassado ao upstream e o SSE de chat
+    # é convertido para SSE de completions na saída (ver abaixo).
 
     prompt = body.get("prompt")
     if prompt is None or (isinstance(prompt, str) and not prompt.strip()):
@@ -761,13 +756,16 @@ def legacy_completions():
                 value = [value]
             chat_body[field] = value
     chat_body["model"] = current_model
+    if body.get("stream"):
+        chat_body["stream"] = True
 
     req_data = json.dumps(
         chat_body, ensure_ascii=False, separators=(",", ":"),
     ).encode("utf-8")
 
     log.info(
-        "legacy completions -> chat/completions model=%s", current_model,
+        "legacy completions -> chat/completions model=%s stream=%s",
+        current_model, bool(body.get("stream")),
     )
 
     resp, last_error = forward_to_nvidia(
@@ -775,6 +773,78 @@ def legacy_completions():
     )
     if resp is None:
         return openai_error(502, f"NVIDIA proxy error: {last_error}", "api_error")
+
+    # -------- STREAMING: SSE chat -> SSE completions --------
+    # O upstream devolveu SSE de chat (choices[0].delta.content).
+    # Convertemos cada evento para o formato completions
+    # (choices[0].text) on-the-fly, preservando o enquadramento
+    # SSE original (data: ...\n\n) e o [DONE].
+    if body.get("stream") and resp.status_code == 200:
+        upstream_gen = resp.response
+
+        def sse_convert():
+            # iter_content não respeita enquadramento SSE: uma linha
+            # data: pode vir partida em dois chunks. Buffer + split
+            # em \n mantém o resto da linha para o próximo chunk.
+            buf = bytearray()
+            _add_streams(1)
+            try:
+                for raw in upstream_gen:
+                    buf.extend(raw)
+                    while True:
+                        nl = buf.find(b"\n")
+                        if nl == -1:
+                            break
+                        line = bytes(buf[:nl])
+                        del buf[:nl + 1]
+                        if not line.startswith(b"data:"):
+                            continue
+                        payload = line[5:].strip()
+                        if not payload:
+                            continue
+                        if payload == b"[DONE]":
+                            yield b"data: [DONE]\n\n"
+                            continue
+                        try:
+                            chunk = json.loads(payload)
+                        except Exception:
+                            continue
+                        choices = chunk.get("choices") or []
+                        if not choices:
+                            continue
+                        ch = choices[0] or {}
+                        delta = ch.get("delta") or {}
+                        out = {
+                            "id": chunk.get("id") or f"cmpl-{request_id}",
+                            "object": "text_completion.chunk",
+                            "created": chunk.get("created") or int(time.time()),
+                            "model": chunk.get("model") or current_model,
+                            "choices": [{
+                                "text": delta.get("content") or "",
+                                "index": 0,
+                                "finish_reason": (
+                                    "length"
+                                    if ch.get("finish_reason") == "length"
+                                    else ch.get("finish_reason")
+                                ),
+                            }],
+                        }
+                        yield (
+                            "data: "
+                            + json.dumps(out, ensure_ascii=False)
+                            + "\n\n"
+                        ).encode("utf-8")
+            finally:
+                _add_streams(-1)
+
+        stream_resp = Response(
+            sse_convert(),
+            status=200,
+            content_type="text/event-stream",
+        )
+        stream_resp.headers["X-Request-Id"] = request_id
+        stream_resp.headers["Cache-Control"] = "no-cache"
+        return stream_resp
 
     # -------- Tradução da resposta: chat -> completions --------
     # Respostas de erro (4xx/5xx do upstream já não-caem no failover)
