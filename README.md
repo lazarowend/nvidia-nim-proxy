@@ -30,11 +30,16 @@ Token bucket por key (39 RPM, configurável): cada key só é usada na velocidad
 
 ### 4. Dashboard web integrado (React)
 Abra `http://127.0.0.1:5000/` no navegador:
+
+![dashboard](web/dashboard-screenshot.png)
+
 - **Status geral**: Operacional / Degradado / Offline
 - **Keys**: "X de Y" disponíveis, barra de tokens por key, cooldown com contagem regressiva, último erro e estatísticas (req/ok/falha/429) por key
 - **Modelo**: qual está em uso, lista de disponíveis e **troca em runtime** — sem restart
 - **Uptime**, RPM total, streams ativos, requisições em espera, totais agregados
-- Atualiza a cada 4s; funciona offline (banner com retry)
+- Atualiza a cada 4s (pausa em aba oculta); funciona offline (banner com retry)
+
+> **Nota para desenvolvimento do dashboard**: o dev server do Vite escuta apenas em `localhost` (IPv6) — use `http://localhost:5173`, não `http://127.0.0.1:5173`.
 
 ### 5. Observabilidade
 - Log com **request-id** (`X-Request-Id`) que rastreia uma requisição através de todas as tentativas de failover — devolvido ao cliente no response
@@ -67,11 +72,9 @@ Modelos disponíveis: `moonshotai/kimi-k3`, `z-ai/glm-5.3`, `nvidia/nemotron-3-s
 ### 1. Clone o repositório
 
 ```bash
-git clone <URL-do-repo> nvidia-proxy
-cd nvidia-proxy
+git clone https://github.com/lazarowend/nvidia-nim-proxy.git nvidia-nim-proxy
+cd nvidia-nim-proxy
 ```
-
-(Windows: `git clone <URL-do-repo> C:\nvidia-proxy` e `cd C:\nvidia-proxy`.)
 
 ### 2. Configure suas keys da NVIDIA
 
@@ -134,7 +137,7 @@ Sem `PROXY_MODEL` no `.env`, abre o **menu interativo** de seleção de modelo n
 
 ### Desenvolvimento do dashboard
 
-Pré-requisito: Node 18+.
+Pré-requisito: Node 18+. O proxy precisa estar rodando na porta 5000 (o dev server encaminha `/health` e `/admin` para ele).
 
 ```bash
 cd web
@@ -192,7 +195,7 @@ curl -X POST http://127.0.0.1:5000/admin/model \
 ## Estrutura do projeto
 
 ```
-nvidia-proxy/
+nvidia-nim-proxy/
 ├── proxy.py               # API Flask (pool, failover, rate limit, admin)
 ├── requirements.txt       # flask, requests, python-dotenv, waitress
 ├── .env.example           # template de configuração (.env real é gitignored)
@@ -203,7 +206,9 @@ nvidia-proxy/
 ├── ANALISE.md              # auditoria técnica (4 agentes, 30 testes)
 └── web/                    # dashboard React 19 + Vite
     ├── src/App.jsx         # dashboard completo (pt-BR, tema escuro)
-    └── README.md           # docs específicas do frontend
+    ├── src/styles.css      # tema escuro, CSS puro (sem framework)
+    ├── vite.config.js      # dev: proxy /health e /admin → 127.0.0.1:5000
+    └── dashboard-screenshot.png
 ```
 
 ---
