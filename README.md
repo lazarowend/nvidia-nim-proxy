@@ -76,12 +76,20 @@ git clone https://github.com/lazarowend/nvidia-nim-proxy.git nvidia-nim-proxy
 cd nvidia-nim-proxy
 ```
 
+Funciona igual em Linux, macOS e Windows.
+
 ### 2. Configure suas keys da NVIDIA
 
-Crie o `.env` a partir do template:
+Crie o `.env` a partir do template (Linux/macOS):
 
 ```bash
-cp .env.example .env        # Windows PowerShell: copy .env.example .env
+cp .env.example .env
+```
+
+Windows (PowerShell):
+
+```powershell
+copy .env.example .env
 ```
 
 Edite o `.env` e preencha ao menos uma key (obtida em https://build.nvidia.com, em "Get API Key"):
@@ -97,7 +105,15 @@ Preencher mais keys (`NVIDIA_API_KEY_2`..`10`) aumenta a vazão agregada — o p
 
 ### Opção A — Docker (recomendado)
 
-Pré-requisito: Docker Desktop (ou qualquer Docker com compose v2).
+Pré-requisitos:
+
+| SO | O que instalar |
+|---|---|
+| Linux | Docker Engine + plugin compose v2 (`docker-compose-plugin`) |
+| macOS | Docker Desktop (ou colima/orbctl + compose v2) |
+| Windows | Docker Desktop (WSL2) |
+
+O comando é o mesmo nos três:
 
 ```bash
 docker compose up -d --build
@@ -126,9 +142,18 @@ Detalhes (healthcheck, logs rotativos, bind loopback, troca de porta sem conflit
 
 ### Opção B — Direto no host
 
-Pré-requisito: Python 3.10+.
+Pré-requisito: Python 3.10+ (Linux, macOS ou Windows).
+
+Linux / macOS:
 
 ```bash
+python3 -m pip install -r requirements.txt
+python3 proxy.py
+```
+
+Windows:
+
+```powershell
 pip install -r requirements.txt
 python proxy.py
 ```
