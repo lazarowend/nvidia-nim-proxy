@@ -1,0 +1,42 @@
+# Contexto de build mínimo — só o que as stages realmente usam:
+# proxy.py, requirements.txt e o código-fonte do frontend (web/
+# sem node_modules e sem dist). Tudo abaixo fica FORA do build.
+
+# ── Segredos: NUNCA no contexto de build ──────────────────────
+# As API keys entram apenas em runtime, via env_file do compose.
+.env
+.env.*
+**/.env
+**/.env.*
+
+# ── Backups / artefatos Python ────────────────────────────────
+backup_*/
+__pycache__/
+*.pyc
+
+# ── Git, docs e imagens de README ─────────────────────────────
+# .git sem barra: casa com o diretório (checkout principal) e com
+# o arquivo-ponteiro (git worktree).
+.git
+*.md
+**/*.md
+web/dashboard-screenshot.png
+
+# ── Frontend: o build roda DENTRO da imagem (stage node) ──────
+# node_modules e dist do host não têm por que entrar no contexto.
+web/node_modules/
+web/dist/
+
+# ── Worktrees de subagentes (cópias do repo; build a partir do
+#    checkout principal não deve carregá-las) ─────────────────
+.worktrees/
+
+# ── Lixo de sistema ──────────────────────────────────────────
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ── Os próprios artefatos Docker não são código-fonte ─────────
+.dockerignore
+Dockerfile
+docker-compose.yml

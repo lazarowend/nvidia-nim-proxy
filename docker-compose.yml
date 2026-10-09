@@ -1,0 +1,53 @@
+# NVIDIA NIM -> Hermes Proxy — deploy local em container.
+# Uso: docker compose up -d --build
+#
+# A porta do HOST é controlada por PROXY_PORT (.env ou shell) na
+# interpolação abaixo; o serviço é publicado SÓ no loopback —
+# nada exposto na rede local. Uso local.
+
+services:
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: nvidia-proxy
+    container_name: nvidia-proxy
+
+    # Segredos (NVIDIA_API_KEY_*, PROXY_MODEL, tuning) entram apenas
+    # em runtime via .env — o arquivo nunca entra na imagem
+    # (ver .dockerignore). Sem TTY no container, PROXY_MODEL é
+    # obrigatório no .env (o menu interativo não roda).
+    env_file:
+      - .env
+
+    # Fixam o listener DENTRO do container. `environment` tem
+    # precedência sobre `env_file`: mesmo que o .env defina
+    # PROXY_PORT (porta do HOST no mapeamento), o proxy sempre
+    # escuta em 5000 internamente — o lado direito do `ports`
+    # e o healthcheck dependem disso.
+    environment:
+      PROXY_HOST: "0.0.0.0"
+      PROXY_PORT: "5000"
+
+    ports:
+      - "127.0.0.1:${PROXY_PORT:-5000}:5000"
+
+    restart: unless-stopped
+
+    healthcheck:
+      # /health não consome key nem token do pool.
+      test: ["CMD", "curl", "-fs", "http://127.0.0.1:5000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+    # waitress drena conexões no SIGTERM; 20s cobre streams SSE
+    # em curso antes do SIGKILL.
+    stop_grace_period: 20s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

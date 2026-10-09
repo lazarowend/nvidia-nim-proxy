@@ -17,13 +17,14 @@ Mudanças desta versão: ver ANALISE.md (C1, A2-A4, M1-M2, M4, M8-M9, B1-B8).
 import json
 import logging
 import os
+import sys
 import threading
 import time
 import uuid
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, Response, request
+from flask import Flask, Response, request, send_from_directory
 
 # ============================================================
 # CONFIGURAÇÃO
@@ -46,8 +47,16 @@ AVAILABLE_MODELS = {
     "5": "z-ai/glm-5.3-flash",
 }
 
-# Modelo em uso — setado no menu interativo (__main__) ou via POST /admin/model.
-DEFAULT_NVIDIA_MODEL = None
+# Modelo em uso — prioridade: PROXY_MODEL (env) > menu interativo (apenas no
+# __main__ com TTY) > POST /admin/model em runtime. Em import/WSGI nunca
+# bloqueia: sem env fica None e o override de model é ignorado (nunca null).
+DEFAULT_NVIDIA_MODEL = (os.getenv("PROXY_MODEL") or "").strip() or None
+
+# Build do dashboard (web/dist) servido na mesma origem da API — sem CORS.
+STATIC_DIR = os.getenv(
+    "PROXY_STATIC_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "dist"),
+)
 
 # ============================================================
 # RATE LIMIT
@@ -764,6 +773,13 @@ def admin_model():
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
 )
 def catch_all(path):
+    # Dashboard estático (se o build existir) — mesma origem que a API.
+    # send_from_directory + normpath bloqueiam path traversal em arquivos.
+    if request.method == "GET" and os.path.isdir(STATIC_DIR):
+        rel = "index.html" if path == "" else path
+        full = os.path.normpath(os.path.join(STATIC_DIR, rel))
+        if full.startswith(os.path.normpath(STATIC_DIR)) and os.path.isfile(full):
+            return send_from_directory(STATIC_DIR, rel)
     return proxy(path)
 
 
@@ -810,7 +826,14 @@ def select_model():
 
 if __name__ == "__main__":
 
-    DEFAULT_NVIDIA_MODEL = select_model()
+    if not DEFAULT_NVIDIA_MODEL:
+        if sys.stdin and sys.stdin.isatty():
+            DEFAULT_NVIDIA_MODEL = select_model()
+        else:
+            raise RuntimeError(
+                "PROXY_MODEL não definido e sem terminal interativo.\n"
+                "Configure PROXY_MODEL no .env (ex.: PROXY_MODEL=z-ai/glm-5.3)."
+            )
 
     total_burst = BURST_CAPACITY * len(API_KEYS)
     total_rpm = TARGET_RPM_PER_KEY * len(API_KEYS)
@@ -826,8 +849,26 @@ if __name__ == "__main__":
     print(f"Read timeout:  {READ_TIMEOUT}s | Orçamento de espera: {WAIT_BUDGET}s")
     print("Token Bucket: ATIVADO | Streaming: ATIVADO | Failover: ATIVADO")
     print("Health: /health | Troca de modelo em runtime: /admin/model")
-    print("URL: http://127.0.0.1:5000")
     print("=" * 65)
     print()
 
-    app.run(host="127.0.0.1", port=5000, threaded=True)
+    host = os.getenv("PROXY_HOST", "127.0.0.1")
+    port = int(os.getenv("PROXY_PORT", "5000"))
+    print(f"URL: http://{host}:{port}")
+    print("=" * 65)
+    print()
+
+    # Waitress quando disponível (produção, drena conexões no stop);
+    # werkzeug dev server apenas como fallback explícito (PROXY_SERVER=flask).
+    server = os.getenv("PROXY_SERVER", "auto")
+    try:
+        from waitress import serve as waitress_serve
+    except ImportError:
+        waitress_serve = None
+
+    if waitress_serve and server != "flask":
+        print(f"Servidor: waitress | threads=16 | http://{host}:{port}")
+        waitress_serve(app, host=host, port=port, threads=16)
+    else:
+        print(f"Servidor: werkzeug dev | http://{host}:{port}")
+        app.run(host=host, port=port, threaded=True)
