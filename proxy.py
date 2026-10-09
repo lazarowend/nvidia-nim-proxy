@@ -10,8 +10,12 @@ Proxy local OpenAI-compatível para a API NVIDIA NIM.
 - GET /v1/models servido localmente (coerente com o model override)
 - /health com estatísticas por key, uptime e status degraded
 - POST /admin/model troca o modelo em runtime (sem restart)
+- POST /v1/completions (legacy OpenAI) com TRADUÇÃO de protocolo para o
+  chat/completions do NIM (o upstream não tem /v1/completions nativo)
 
 Mudanças desta versão: ver ANALISE.md (C1, A2-A4, M1-M2, M4, M8-M9, B1-B8).
+v2.2.0: rota POST /v1/completions com tradução de protocolo; núcleo de
+failover extraído de proxy() para forward_to_nvidia() reutilizável.
 """
 
 import json
@@ -24,7 +28,7 @@ import uuid
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, Response, request, send_from_directory
+from flask import Flask, Response, jsonify, request, send_from_directory
 
 # ============================================================
 # CONFIGURAÇÃO
@@ -34,7 +38,7 @@ load_dotenv()
 
 app = Flask(__name__)
 
-PROXY_VERSION = "2.0.0"
+PROXY_VERSION = "2.2.0"
 
 TARGET_URL = os.getenv("PROXY_TARGET_URL", "https://integrate.api.nvidia.com")
 
@@ -345,45 +349,20 @@ def normalize_path(path):
 
 
 # ============================================================
-# PROXY
+# FORWARD AO NVIDIA NIM (núcleo de tentativas — reutilizável)
 # ============================================================
+# Extraído de proxy(): espera por key disponível dentro do orçamento
+# global de espera (WAIT_BUDGET), loop de attempts sobre o pool,
+# requests.request(stream=True) e tratamento de 429 (honra Retry-After
+# com teto), 401/403 (cooldown longo), 5xx e timeout. A rota legacy
+# /v1/completions chama exatamente este núcleo: mesmo pool de keys,
+# mesmo token bucket, mesmo failover.
+# Depende do request context do Flask (method, args, headers).
+# Devolve (Response, last_error): Response=None quando todas as keys
+# falharam; nesse caso last_error explica a última falha.
 
-def proxy(path):
-    request_id = request.headers.get("X-Request-Id") or uuid.uuid4().hex[:12]
-    log = logging.LoggerAdapter(logger, {"request_id": request_id})
-
-    # Dot-segments (path traversal): rejeita antes de encaminhar.
-    if any(seg in ("..", ".") for seg in path.split("/")):
-        return openai_error(400, "Path inválido.", "invalid_request_error")
-
-    clean_path = normalize_path(path)
+def forward_to_nvidia(clean_path, req_data, request_id, log):
     url = f"{TARGET_URL}/{clean_path}"
-
-    log.info("router original=/%s -> nvidia=/%s", path, clean_path)
-
-    # --------------------------------------------------------
-    # Endpoints servidos localmente (não consomem key nem token)
-    # --------------------------------------------------------
-
-    if request.method == "OPTIONS":
-        resp = Response(status=204)
-        resp.headers["Allow"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-        resp.headers["X-Request-Id"] = request_id
-        return resp
-
-    if clean_path == "v1/models" and request.method == "GET":
-        with model_lock:
-            current = DEFAULT_NVIDIA_MODEL
-        if current:
-            data = [{"id": current, "object": "model", "owned_by": "proxy"}]
-        else:
-            data = [
-                {"id": m, "object": "model", "owned_by": "proxy"}
-                for m in sorted(set(AVAILABLE_MODELS.values()))
-            ]
-        return {"object": "list", "data": data}
-
-    req_data = prepare_request_body(clean_path)
 
     attempted_keys = set()
     max_attempts = len(API_KEYS)
@@ -436,11 +415,12 @@ def proxy(path):
                 if next_wait is None:
                     # Todas as keys já foram tentadas nesta request.
                     log.warning("espera: nenhuma candidata restante")
-                    return openai_error(
+                    exhausted = openai_error(
                         429,
                         "Todas as API keys estão temporariamente indisponíveis.",
                         "rate_limit_error",
                     )
+                    return exhausted, None
 
                 if remaining <= 0 or next_wait >= remaining:
                     # Nenhuma key servirá dentro do orçamento: falhe já,
@@ -449,12 +429,13 @@ def proxy(path):
                         "espera esgotada: nenhuma key disponível a tempo "
                         "(next_wait=%.2fs)", next_wait,
                     )
-                    return openai_error(
+                    exhausted = openai_error(
                         429,
                         "Todas as API keys estão temporariamente indisponíveis.",
                         "rate_limit_error",
                         retry_after=next_wait,
                     )
+                    return exhausted, None
 
                 # Dorme o tempo exato até a próxima candidata (não polling fixo).
                 time.sleep(max(0.001, min(next_wait, remaining)))
@@ -605,10 +586,13 @@ def proxy(path):
                         _record_failure(key_index, reason)
                         set_key_cooldown(key_index)
 
-            return Response(
-                generate(),
-                status=response.status_code,
-                headers=response_headers,
+            return (
+                Response(
+                    generate(),
+                    status=response.status_code,
+                    headers=response_headers,
+                ),
+                None,
             )
 
         # ====================================================
@@ -648,7 +632,187 @@ def proxy(path):
     # ========================================================
 
     log.error("todas as %s keys falharam. último erro: %s", len(API_KEYS), last_error)
-    return openai_error(502, f"NVIDIA proxy error: {last_error}", "api_error")
+    return None, last_error
+
+
+# ============================================================
+# PROXY (roteador geral — usa o núcleo de tentativas)
+# ============================================================
+
+def proxy(path):
+    request_id = request.headers.get("X-Request-Id") or uuid.uuid4().hex[:12]
+    log = logging.LoggerAdapter(logger, {"request_id": request_id})
+
+    # Dot-segments (path traversal): rejeita antes de encaminhar.
+    if any(seg in ("..", ".") for seg in path.split("/")):
+        return openai_error(400, "Path inválido.", "invalid_request_error")
+
+    clean_path = normalize_path(path)
+
+    log.info("router original=/%s -> nvidia=/%s", path, clean_path)
+
+    # --------------------------------------------------------
+    # Endpoints servidos localmente (não consomem key nem token)
+    # --------------------------------------------------------
+
+    if request.method == "OPTIONS":
+        resp = Response(status=204)
+        resp.headers["Allow"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+        resp.headers["X-Request-Id"] = request_id
+        return resp
+
+    if clean_path == "v1/models" and request.method == "GET":
+        with model_lock:
+            current = DEFAULT_NVIDIA_MODEL
+        if current:
+            data = [{"id": current, "object": "model", "owned_by": "proxy"}]
+        else:
+            data = [
+                {"id": m, "object": "model", "owned_by": "proxy"}
+                for m in sorted(set(AVAILABLE_MODELS.values()))
+            ]
+        return {"object": "list", "data": data}
+
+    req_data = prepare_request_body(clean_path)
+
+    resp, last_error = forward_to_nvidia(clean_path, req_data, request_id, log)
+    if resp is None:
+        # Todas as keys falharam: mesmo 502 de antes (formato OpenAI).
+        return openai_error(502, f"NVIDIA proxy error: {last_error}", "api_error")
+    return resp
+
+
+# ============================================================
+# LEGACY — POST /v1/completions (tradução de protocolo)
+# ============================================================
+# O NVIDIA NIM não expõe /v1/completions (404 upstream). Esta rota
+# recebe o formato legacy de completions, traduz para chat/completions,
+# envia pelo MESMO núcleo de tentativas (pool + failover + token
+# bucket) e traduz a resposta de volta (choices[0].message.content
+# -> choices[0].text), formato esperado por clientes legacy.
+#
+# Decisão de design — stream: REJEITADO com 400. Converter SSE de
+# chat para SSE de completions exigiria parser de eventos, buffer de
+# deltas e remontagem de text on-the-fly; clientes legacy que usam
+# /v1/completions raramente streamam, e a simplicidade correta vale
+# mais que cobertura completa. Documentado e com erro claro.
+
+# Campos de completions aceitos e repassados ao chat/completions.
+COMPLETIONS_PASSTHROUGH_FIELDS = (
+    "max_tokens", "temperature", "top_p", "stop",
+    "seed", "presence_penalty", "frequency_penalty",
+)
+
+
+@app.route("/v1/completions", methods=["POST"])
+def legacy_completions():
+    request_id = request.headers.get("X-Request-Id") or uuid.uuid4().hex[:12]
+    log = logging.LoggerAdapter(logger, {"request_id": request_id})
+
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return openai_error(
+            400, "Body JSON inválido para /v1/completions.",
+            "invalid_request_error",
+        )
+
+    # -------- Validações do formato legacy --------
+    if "stream" in body and body["stream"]:
+        return openai_error(
+            400,
+            "stream=true não é suportado em /v1/completions. "
+            "Use /v1/chat/completions para streaming.",
+            "invalid_request_error",
+        )
+
+    prompt = body.get("prompt")
+    if prompt is None or (isinstance(prompt, str) and not prompt.strip()):
+        return openai_error(
+            400,
+            "Campo 'prompt' obrigatório (string não vazia) para "
+            "/v1/completions.",
+            "invalid_request_error",
+        )
+    if not isinstance(prompt, str):
+        return openai_error(
+            400,
+            "Campo 'prompt' deve ser uma string. Lista de prompts não é "
+            "suportada; faça uma requisição por prompt.",
+            "invalid_request_error",
+        )
+
+    # -------- Modelo global (nunca null; ignora o do body) --------
+    with model_lock:
+        current_model = DEFAULT_NVIDIA_MODEL
+    if not current_model:
+        return openai_error(
+            503,
+            "Nenhum modelo definido. Configure PROXY_MODEL no .env ou "
+            "troque via POST /admin/model.",
+            "api_error",
+        )
+
+    # -------- Tradução completions -> chat --------
+    chat_body = {"messages": [{"role": "user", "content": prompt}]}
+    for field in COMPLETIONS_PASSTHROUGH_FIELDS:
+        if field in body:
+            value = body[field]
+            if field == "stop" and isinstance(value, str):
+                value = [value]
+            chat_body[field] = value
+    chat_body["model"] = current_model
+
+    req_data = json.dumps(
+        chat_body, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")
+
+    log.info(
+        "legacy completions -> chat/completions model=%s", current_model,
+    )
+
+    resp, last_error = forward_to_nvidia(
+        "v1/chat/completions", req_data, request_id, log,
+    )
+    if resp is None:
+        return openai_error(502, f"NVIDIA proxy error: {last_error}", "api_error")
+
+    # -------- Tradução da resposta: chat -> completions --------
+    # Respostas de erro (4xx/5xx do upstream já não-caem no failover)
+    # são repassadas como vieram; só o corpo 200 é traduzido.
+    if resp.status_code != 200:
+        return resp
+
+    try:
+        chat_json = json.loads(resp.get_data())
+    except Exception:
+        return resp  # corpo não-JSON: repassa intacto
+
+    choices = chat_json.get("choices") or []
+    if not choices:
+        return openai_error(
+            502,
+            "Resposta do upstream sem choices ao traduzir completions.",
+            "api_error",
+        )
+
+    finish = (choices[0].get("finish_reason") or "stop")
+    completions_json = {
+        "id": chat_json.get("id") or f"cmpl-{request_id}",
+        "object": "text_completion",
+        "created": chat_json.get("created") or int(time.time()),
+        "model": chat_json.get("model") or current_model,
+        "choices": [{
+            "text": choices[0].get("message", {}).get("content", ""),
+            "index": 0,
+            "finish_reason": "length" if finish == "length" else "stop",
+        }],
+    }
+    if "usage" in chat_json:
+        completions_json["usage"] = chat_json["usage"]
+
+    out = jsonify(completions_json)
+    out.headers["X-Request-Id"] = request_id
+    return out
 
 
 # ============================================================
@@ -849,6 +1013,7 @@ if __name__ == "__main__":
     print(f"Read timeout:  {READ_TIMEOUT}s | Orçamento de espera: {WAIT_BUDGET}s")
     print("Token Bucket: ATIVADO | Streaming: ATIVADO | Failover: ATIVADO")
     print("Health: /health | Troca de modelo em runtime: /admin/model")
+    print("Legacy: POST /v1/completions (traduzido para chat/completions)")
     print("=" * 65)
     print()
 

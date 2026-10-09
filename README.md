@@ -23,10 +23,11 @@ Várias keys da NVIDIA (até 10) num pool round-robin. Se uma key recebe 429, 5x
 Token bucket por key (39 RPM, configurável): cada key só é usada na velocidade que a NVIDIA aceita. Com 4 keys, ~156 requisições/minuto sustentados.
 
 ### 3. Contrato OpenAI respeitado
-- **Erros no formato OpenAI** (`{"error": {"message", "type", "code"}}`) — SDKs parseiam corretamente
+- **Erros no formato OpenAI** (`{"error": {message, type, code}}`) — SDKs parseiam corretamente
 - **`GET /v1/models` coerente**: lista só o que o proxy realmente serve (não o catálogo inteiro da NVIDIA)
-- **Model override**: todo chat completion usa o modelo selecionado, independentemente do que o cliente pediu — troque de modelo sem reconfigurar nada no cliente
+- **Model override**: todo completion usa o modelo selecionado, independentemente do que o cliente pediu — troque de modelo sem reconfigurar nada no cliente
 - **Streaming SSE transparente** com proteção contra o bug de `Content-Encoding` (corpo descomprimido × header gzip) e headers hop-by-hop filtrados (RFC 9110)
+- **`POST /v1/completions` (legacy)**: tradução de protocolo — o NVIDIA NIM não expõe o endpoint nativo, o proxy converte para chat/completions no upstream e devolve `choices[0].text` no formato que clientes legacy esperam (mesmo pool, failover e token bucket; `stream` não suportado nesta rota)
 
 ### 4. Dashboard web integrado (React)
 Abra `http://127.0.0.1:5000/` no navegador:
@@ -124,7 +125,8 @@ Sobe **um container** com proxy + dashboard juntos (build multi-stage: o React �
 | URL | O quê |
 |---|---|
 | http://127.0.0.1:5000/ | Dashboard |
-| http://127.0.0.1:5000/v1/chat/completions | API OpenAI-compatível |
+| http://127.0.0.1:5000/v1/chat/completions | API OpenAI-compatível (chat) |
+| http://127.0.0.1:5000/v1/completions | API legacy completions (`choices[0].text`) |
 | http://127.0.0.1:5000/health | Health check (usado pelo compose) |
 | http://127.0.0.1:5000/admin/model | Troca de modelo (GET lista, POST troca) |
 
@@ -189,6 +191,14 @@ Teste rápido:
 curl http://127.0.0.1:5000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "qualquer", "messages": [{"role": "user", "content": "oi"}]}'
+```
+
+Cliente legacy que usa o endpoint de completions (`choices[0].text`)? Também funciona — o proxy traduz o protocolo:
+
+```bash
+curl http://127.0.0.1:5000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "oi"}'
 ```
 
 Trocar o modelo em uso (sem restart):
